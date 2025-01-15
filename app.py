@@ -1,44 +1,37 @@
-from pywebio import start_server
+from flask import Flask
+from pywebio.platform.flask import webio_view
 from pywebio.input import *
 from pywebio.output import *
-from pywebio.session import set_env
+from pywebio.session import set_env, run_async
 from datetime import datetime
-import time
-import socket
-import sys
-import signal
+import asyncio
 
-def find_free_port(start_port=8000, max_port=9000):
-    """Find a free port between start_port and max_port."""
-    for port in range(start_port, max_port):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('', port))
-                return port
-        except OSError:
-            continue
-    return None         
+app = Flask(__name__)
 
-def signal_handler(sig, frame):
-    print("\nShutting down gracefully...")
-    sys.exit(0)
+messages = []
+clients = set()
 
-def chat_app():
-    set_env(title="Live Chat Support")
+async def chat_app():
+    global messages, clients
     
-    # Styling
-    put_html("""
+    username = await input("Enter your username:", required=True)
+    clients.add(username)
+    
+    set_env(title=f"Chat - {username}")
+    
+    await put_html("""
     <style>
         .chat-container { 
             max-width: 800px;
             margin: 0 auto;
             padding: 20px;
-            background: #fff;
         }
-        .customer-info {
-            background: #f5f5f5;
-            padding: 15px;
-            border-radius: 5px;
+        .messages-container {
+            height: 400px;
+            overflow-y: auto;
+            padding: 20px;
+            background: #fafafa;
+            border-radius: 10px;
             margin-bottom: 20px;
         }
         .message {
@@ -46,109 +39,77 @@ def chat_app():
             padding: 10px;
             border-radius: 10px;
         }
-        .agent-message {
-            background: #85c5e5;
-            margin-left: 20%;
-            color: white;
-        }
         .user-message {
             background: #f0f0f0;
             margin-right: 20%;
         }
-        .timestamp {
-            font-size: 0.8em;
-            color: #666;
+        .other-message {
+            background: #85c5e5;
+            margin-left: 20%;
+            color: white;
         }
-        .input-area {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            padding: 20px;
-            background: white;
-            border-top: 1px solid #eee;
-        }
+        .timestamp { font-size: 0.8em; color: #666; }
+        .username { font-weight: bold; margin-bottom: 5px; }
     </style>
+    <div class="chat-container">
     """)
-
-    # Header
-    put_html('<div class="chat-container">')
     
-    # Customer info section
-    put_html('''
-        <div class="customer-info">
-            <h3>Chloe Smith</h3>
-            <p>Email: chloe@example.com</p>
-            <p>Location: Sydney, Australia</p>
-        </div>
-    ''')
-
-    # Chat messages
-    def add_message(text, is_agent=False):
-        current_time = datetime.now().strftime("%I:%M %p")
-        class_name = "agent-message" if is_agent else "user-message"
-        put_html(f'''
-            <div class="message {class_name}">
-                {text}
-                <div class="timestamp">{current_time}</div>
-            </div>
-        ''')
-
-    # Initial messages
-    add_message("Do you have a trial version available?", False)
-    time.sleep(1)
+    async with use_scope('main'):
+        await put_markdown("## Chat Room")
+        await put_markdown(f"Connected as: **{username}**")
+        await put_html('<div class="messages-container" id="messages"></div>')
     
-    add_message("Unfortunately we do not have a trial or demo that you can install on your own server. "
-                "We also don't have a demo installation setup on our own servers. We feel that it is best "
-                "for customers to try the software on their own server or hosting account to ensure that "
-                "everything functions as expected and is suited to their existing configuration.", True)
-
-    # Chat input
-    while True:
+    update_task = None
+    
+    async def update_messages():
+        last_count = 0
         try:
-            msg = input_group("", [
+            while True:
+                if len(messages) > last_count:
+                    async with use_scope('messages', clear=True):
+                        for msg in messages[-50:]:  # Show last 50 messages
+                            class_name = 'user-message' if msg['username'] == username else 'other-message'
+                            await put_html(f'''
+                                <div class="message {class_name}">
+                                    <div class="username">{msg['username']}</div>
+                                    {msg['text']}
+                                    <div class="timestamp">{msg['time']}</div>
+                                </div>
+                            ''')
+                    last_count = len(messages)
+                await asyncio.sleep(1)  # Reduced update frequency
+        except asyncio.CancelledError:
+            return
+
+    try:
+        update_task = asyncio.create_task(update_messages())
+        
+        while True:
+            msg = await input_group("", [
                 input(placeholder="Type your message here...", name="msg")
             ])
             
-            if msg and msg["msg"]:
-                add_message(msg["msg"], False)
-                time.sleep(1)
-                add_message("Thank you for your message. An agent will respond shortly.", True)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"Error in chat: {e}")
-            break
-
-def main():
-    # Set up signal handler for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    try:
-        # Find an available port
-        port = find_free_port()
-        if port is None:
-            print("Error: Could not find an available port")
-            sys.exit(1)
-            
-        print(f"\nStarting chat server on http://127.0.0.1:{port}")
-        print("Press Ctrl+C to stop the server")
-        
-        start_server(
-            applications=chat_app,
-            port=port,
-            debug=True,
-            host='0.0.0.0',
-            cdn=False,
-            auto_open_webbrowser=True
-        )
+            if msg and msg["msg"].strip():
+                messages.append({
+                    'username': username,
+                    'text': msg["msg"],
+                    'time': datetime.now().strftime("%I:%M %p")
+                })
+                if len(messages) > 100:  # Keep only last 100 messages
+                    messages.pop(0)
+                
     except Exception as e:
-        print(f"\nError starting server: {e}")
-        sys.exit(1)
+        print(f"Chat error: {e}")
+    finally:
+        if update_task:
+            update_task.cancel()
+            try:
+                await update_task
+            except asyncio.CancelledError:
+                pass
+        clients.remove(username)
+
+app.add_url_rule('/', 'webio_view', webio_view(chat_app), methods=['GET', 'POST', 'OPTIONS'])
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nShutting down gracefully...")
-        sys.exit(0)
+    app.run(host='127.0.0.1', port=8000)
